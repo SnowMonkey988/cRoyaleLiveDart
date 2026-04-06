@@ -70,6 +70,116 @@ function getOrCreateSession(sessionId) {
   return sessions.get(sessionId);
 }
 
+/**
+ * Extract the real visitor IP, accounting for Railway's reverse proxy.
+ */
+function getClientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) {
+    // x-forwarded-for can be a comma-separated list; first entry is the client
+    return forwarded.split(',')[0].trim();
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
+/**
+ * Parse OS and browser name from a User-Agent string without dependencies.
+ */
+function parseUserAgent(ua) {
+  if (!ua) return { os: 'Unknown', browser: 'Unknown' };
+
+  let os = 'Unknown';
+  if (/Windows NT 10/i.test(ua))      os = 'Windows 10/11';
+  else if (/Windows NT 6.3/i.test(ua)) os = 'Windows 8.1';
+  else if (/Windows NT 6.1/i.test(ua)) os = 'Windows 7';
+  else if (/Windows/i.test(ua))        os = 'Windows';
+  else if (/iPhone OS ([\.\d]+)/i.test(ua)) os = 'iOS ' + ua.match(/iPhone OS ([\.\d]+)/i)[1].replace(/_/g, '.');
+  else if (/iPad.*OS ([\.\d]+)/i.test(ua))  os = 'iPadOS ' + ua.match(/iPad.*OS ([\.\d]+)/i)[1].replace(/_/g, '.');
+  else if (/Android ([\d\.]+)/i.test(ua))   os = 'Android ' + ua.match(/Android ([\d\.]+)/i)[1];
+  else if (/Mac OS X ([\d_\.]+)/i.test(ua)) os = 'macOS ' + ua.match(/Mac OS X ([\d_\.]+)/i)[1].replace(/_/g, '.');
+  else if (/Linux/i.test(ua))          os = 'Linux';
+
+  let browser = 'Unknown';
+  if (/Edg\//i.test(ua))              browser = 'Edge ' + (ua.match(/Edg\/([\d\.]+)/i)||[])[1];
+  else if (/OPR\//i.test(ua))         browser = 'Opera ' + (ua.match(/OPR\/([\d\.]+)/i)||[])[1];
+  else if (/SamsungBrowser/i.test(ua)) browser = 'Samsung Browser ' + (ua.match(/SamsungBrowser\/([\d\.]+)/i)||[])[1];
+  else if (/Chrome\/([\d\.]+)/i.test(ua) && !/Chromium/i.test(ua))
+                                       browser = 'Chrome ' + ua.match(/Chrome\/([\d\.]+)/i)[1];
+  else if (/Firefox\/([\d\.]+)/i.test(ua)) browser = 'Firefox ' + ua.match(/Firefox\/([\d\.]+)/i)[1];
+  else if (/Safari\/([\d\.]+)/i.test(ua))  browser = 'Safari ' + (ua.match(/Version\/([\d\.]+)/i)||[])[1];
+  else if (/Chromium/i.test(ua))       browser = 'Chromium';
+
+  return { os, browser };
+}
+
+/**
+ * Geolocate an IP using the free ip-api.com service (no API key needed).
+ * Returns an object with city, region, country, isp, org, timezone, etc.
+ */
+async function geolocateIp(ip) {
+  // Skip private/loopback addresses
+  if (!ip || ip === 'unknown' || /^(127\.|::1|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(ip)) {
+    return { status: 'private', country: 'Local/Private', city: '-', isp: '-', timezone: '-', org: '-' };
+  }
+  try {
+    const res = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,query`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Build the rich Telegram header card shown on the first visitor message.
+ */
+function buildVisitorCard(sessionId, firstMessage, clientIp, geo, vi) {
+  const { os, browser } = parseUserAgent(vi ? vi.userAgent : null);
+
+  const geoLine = geo && geo.status === 'success'
+    ? `🌍 <b>Location:</b> ${geo.city}, ${geo.regionName}, ${geo.country} (${geo.countryCode})
+🗺 <b>Coordinates:</b> ${geo.lat}, ${geo.lon}
+🌐 <b>Timezone:</b> ${geo.timezone}
+🏢 <b>ISP:</b> ${geo.isp}
+🏛 <b>Org:</b> ${geo.org || '-'}`
+    : `🌍 <b>Location:</b> Unable to resolve`;
+
+  const deviceLines = vi
+    ? `💻 <b>Device:</b> ${vi.deviceType} — ${os}
+🌐 <b>Browser:</b> ${browser}
+🗣 <b>Language:</b> ${vi.language}
+🕐 <b>Local Time:</b> ${vi.localTime}
+🕐 <b>Timezone:</b> ${vi.timezone}
+📐 <b>Screen:</b> ${vi.screen} (viewport ${vi.viewport}, ${vi.colorDepth})
+🔗 <b>Referrer:</b> ${vi.referrer}`
+    : `💻 <b>Device:</b> Unknown`;
+
+  return (
+    `🌏 <b>NEW VISITOR CHAT</b>
+` +
+    `━━━━━━━━━━━━━━━━━━━━━━
+` +
+    `🔑 <b>Session:</b> <code>${sessionId}</code>
+` +
+    `🖥 <b>IP Address:</b> <code>${clientIp}</code>
+` +
+    `${geoLine}
+` +
+    `━━━━━━━━━━━━━━━━━━━━━━
+` +
+    `${deviceLines}
+` +
+    `📄 <b>Page:</b> ${vi ? vi.page : 'unknown'}
+` +
+    `━━━━━━━━━━━━━━━━━━━━━━
+` +
+    `👤 <b>Visitor says:</b> ${firstMessage}
+
+` +
+    `<i>↩️ Reply to THIS message to respond to the visitor.</i>`
+  );
+}
+
 async function sendTelegramMessage(text, replyToMessageId = null) {
   const body = {
     chat_id: ADMIN_CHAT_ID,
@@ -98,7 +208,7 @@ async function sendTelegramMessage(text, replyToMessageId = null) {
  * Receives a message from a website visitor and forwards it to Telegram.
  */
 app.post('/api/chat', async (req, res) => {
-  const { sessionId, message, page } = req.body;
+  const { sessionId, message, visitorInfo } = req.body;
 
   if (!sessionId || typeof sessionId !== 'string' || sessionId.length > 100) {
     return res.status(400).json({ error: 'Invalid session' });
@@ -106,38 +216,31 @@ app.post('/api/chat', async (req, res) => {
   if (!message || typeof message !== 'string' || message.trim().length === 0) {
     return res.status(400).json({ error: 'Empty message' });
   }
-  // Truncate extremely long messages
+
   const safeMessage = message.trim().slice(0, 1000);
-  const safePage = (page || '').slice(0, 200);
+  const clientIp = getClientIp(req);
 
   try {
     const session = getOrCreateSession(sessionId);
 
     let telegramText;
     if (!session.telegramMessageId) {
-      // First message from this visitor — include context header
-      telegramText =
-        `🌏 <b>New visitor chat</b>\n` +
-        `🔑 Session: <code>${sessionId}</code>\n` +
-        `📄 Page: ${safePage}\n` +
-        `─────────────────────\n` +
-        `👤 <b>Visitor:</b> ${safeMessage}\n\n` +
-        `<i>Reply to THIS message to respond to the visitor.</i>`;
+      // First message — build the full visitor card with geolocation
+      const geo = await geolocateIp(clientIp);
+      telegramText = buildVisitorCard(sessionId, safeMessage, clientIp, geo, visitorInfo || null);
     } else {
-      // Follow-up message — thread it as a reply to keep context
+      // Follow-up message — keep it short and threaded
       telegramText = `👤 <b>Visitor:</b> ${safeMessage}`;
     }
 
     const sentMsg = await sendTelegramMessage(
       telegramText,
-      session.telegramMessageId // reply to first message to create a thread
+      session.telegramMessageId
     );
 
-    // Store the first message_id as the thread anchor
     if (!session.telegramMessageId) {
       session.telegramMessageId = sentMsg.message_id;
     }
-    // Always track latest visitor message so admin can reply to it
     telegramMsgToSession.set(sentMsg.message_id, sessionId);
 
     res.json({ ok: true });
