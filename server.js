@@ -31,15 +31,25 @@ const BOT_TOKEN      = process.env.BOT_TOKEN      || 'YOUR_TELEGRAM_BOT_TOKEN';
 const ADMIN_CHAT_ID  = process.env.ADMIN_CHAT_ID  || 'YOUR_GROUP_OR_CHAT_ID';  // number as string e.g. '-1001234567890'
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'change_this_to_a_random_secret';
 const PORT           = process.env.PORT           || 3000;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*'; // Set to your website domain in production e.g. 'https://chinaroyaletravels.com'
+const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGIN || '*').replace(/\/+$/, '');
 
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 // ───────────────────────────────────────────────────────────────────────────
 
+app.options('*', cors());
+
 // CORS — only allow your website origin in production
 app.use(cors({
-  origin: ALLOWED_ORIGIN,
-  methods: ['GET', 'POST']
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true); // server-to-server / curl
+    const normOrigin = origin.replace(/\/+$/, '');
+    if (ALLOWED_ORIGIN === '*' || normOrigin === ALLOWED_ORIGIN) {
+      return callback(null, true);
+    }
+    return callback(new Error('CORS: origin not allowed'));
+  },
+  methods: ['GET', 'POST'],
+  optionsSuccessStatus: 200
 }));
 
 /**
